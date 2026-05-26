@@ -1,87 +1,170 @@
 import os
 import warnings
+from typing import TypedDict, List, Dict, Any
 from dotenv import load_dotenv
 from langchain_openai import ChatOpenAI
 from langchain_core.messages import SystemMessage, HumanMessage
-from langgraph.prebuilt import create_react_agent
+from langgraph.graph import StateGraph, START, END
+from langgraph.checkpoint.memory import MemorySaver
 
-# השתקת אזהרות פג תוקף (Deprecation Warnings)
+# השתקת אזהרות פג-תוקף
 warnings.filterwarnings("ignore", category=DeprecationWarning)
-warnings.filterwarnings("ignore", category=UserWarning)
 
-# מנגנון ייבוא חכם ל-Tavily
+# ייבוא חכם של Tavily
 try:
     from langchain_tavily import TavilySearchResults
 except ImportError:
     from langchain_community.tools.tavily_search import TavilySearchResults
 
-# טעינת מפתחות ה-API
+# טעינת מפתחות API
 load_dotenv()
 
-def verify_api_keys() -> None:
-    """ודא שמפתחות ה-API הוגדרו בהצלחה בקובץ .env"""
-    if not os.getenv("OPENAI_API_KEY"):
-        raise ValueError("❌ ERROR: OPENAI_API_KEY is missing. Please check your .env file.")
-    if not os.getenv("TAVILY_API_KEY"):
-        raise ValueError("❌ ERROR: TAVILY_API_KEY is missing. Please check your .env file.")
+# ==========================================
+# 1. הגדרת ה-State (המצב) של הגרף
+# ==========================================
+class ResearchState(TypedDict):
+    topic: str                  # הנושא שנחקר
+    raw_sources: List[Dict[str, Any]]  # כל המקורות שנמצאו בחיפוש
+    approved_sources: List[Dict[str, Any]]  # המקורות שהמשתמש אישר
+    summary: str                # הסיכום הסופי של המקורות המאושרים
 
-def run_research_agent(topic: str) -> None:
-    """
-    מפעילה סוכן לאיסוף מקורות מידע באמצעות מנוע החיפוש Tavily.
-    """
-    verify_api_keys()
 
-    # 1. אתחול מודל השפה
-    llm = ChatOpenAI(model="gpt-4o-mini", temperature=0.2)
+# ==========================================
+# 2. הגדרת הפונקציות (Nodes) של הגרף
+# ==========================================
 
-    # 2. אתחול כלי החיפוש של Tavily (מקסימום 3 תוצאות)
-    search_tool = TavilySearchResults(max_results=3)
-    tools = [search_tool]
-
-    # 3. הגדרת הנחיות המערכת (System Prompt)
-    system_prompt = (
-        "You are an expert research assistant for a NotebookLM-like application.\n"
-        "Your mission is to gather high-quality, reliable, and diverse sources about the user's topic.\n\n"
-        "Instructions:\n"
-        "1. Identify key search terms and use the search tool to find real web articles or documentation.\n"
-        "2. Present your findings in a structured list. For each source, you MUST include:\n"
-        "   - **Title**: The title of the page.\n"
-        "   - **URL**: The exact web link (do not hallucinate or change URLs).\n"
-        "   - **Description**: A 2-sentence summary of what this source contains.\n"
-        "3. Only use real links provided by the tool. Be factual and objective."
-    )
-
-    # 4. יצירת ה-Agent הבסיסי - ללא פרמטרים שמשתנים בין גרסאות!
-    # פתרון זה תואם 100% לכל גרסאות LangGraph בעבר ובעתיד
-    agent_executor = create_react_agent(
-        model=llm,
-        tools=tools
-    )
-
-    print(f"🕵️‍♂️ Agent initialized. Searching the web for: '{topic}'...\n")
-
-    try:
-        # 5. הפעלת הסוכן: אנו מעבירים את ה-System Prompt כהודעה הראשונה בגרף
-        response = agent_executor.invoke({
-            "messages": [
-                SystemMessage(content=system_prompt),
-                HumanMessage(content=f"Please find high-quality sources about: {topic}")
-            ]
+def gather_sources(state: ResearchState) -> Dict[str, Any]:
+    """שלב א' - חיפוש מקורות מידע ברשת באמצעות Tavily"""
+    topic = state["topic"]
+    print(f"\n🔎 Searching the web for: '{topic}'...")
+    
+    # הפעלת כלי החיפוש
+    search_tool = TavilySearchResults(max_results=5)
+    search_results = search_tool.invoke({"query": topic})
+    
+    sources = []
+    # עיבוד התוצאות למבנה פשוט ונוח
+    for idx, result in enumerate(search_results, 1):
+        sources.append({
+            "id": idx,
+            "title": result.get("title", f"Source {idx}"),
+            "url": result.get("url", "#"),
+            "content": result.get("content", "")
         })
-
-        # חילוץ ההודעה האחרונה בגרף (התוצאה הסופית)
-        final_message = response["messages"][-1]
         
-        print("\n" + "="*50)
-        print("📋 AGENT RESEARCH RESULTS:")
-        print("="*50)
-        print(final_message.content)
-        print("="*50)
+    return {"raw_sources": sources}
 
-    except Exception as e:
-        print(f"❌ An error occurred during search: {e}")
+
+def summarize_sources(state: ResearchState) -> Dict[str, Any]:
+    """שלב ג' - סיכום המקורות שאושרו בלבד"""
+    approved = state.get("approved_sources", [])
+    if not approved:
+        return {"summary": "No sources were approved by the user."}
+    
+    print("\n✍️ Generating summary from approved sources...")
+    
+    # בניית הקשר (Context) מהמקורות המאושרים
+    context_parts = []
+    for src in approved:
+        context_parts.append(f"Title: {src['title']}\nURL: {src['url']}\nContent: {src['content']}\n---")
+    context = "\n".join(context_parts)
+    
+    # פנייה ל-LLM לצורך סיכום ממוקד
+    llm = ChatOpenAI(model="gpt-4o-mini", temperature=0.3)
+    
+    system_prompt = (
+        "You are an expert editor. Summarize the approved sources provided below into a structured summary.\n"
+        "Focus on extracting key insights, and list the verified URLs at the end as references."
+    )
+    
+    response = llm.invoke([
+        SystemMessage(content=system_prompt),
+        HumanMessage(content=f"Topic: {state['topic']}\n\nSources Context:\n{context}")
+    ])
+    
+    return {"summary": response.content}
+
+
+# ==========================================
+# 3. בניית ה-Workflow וחיבור ה-Checkpointer
+# ==========================================
+
+# יצירת Graph חדש המבוסס על ה-State שלנו
+workflow = StateGraph(ResearchState)
+
+# הוספת הבלוקים (Nodes) לגרף
+workflow.add_node("gather_sources", gather_sources)
+workflow.add_node("summarize_sources", summarize_sources)
+
+# הגדרת זרימת העבודה (Edges)
+workflow.add_edge(START, "gather_sources")
+workflow.add_edge("gather_sources", "summarize_sources")
+workflow.add_edge("summarize_sources", END)
+
+# יצירת זיכרון זמני (Checkpointer) לשמירת מצב הריצה
+memory = MemorySaver()
+
+# קימפול הגרף עם הגדרת עצירה (Interrupt) לפני שלב הסיכום!
+app = workflow.compile(
+    checkpointer=memory,
+    interrupt_before=["summarize_sources"] # כאן מתרחש ה-Human in the loop
+)
+
+
+# ==========================================
+# 4. הרצת התוכנית הראשית (CLI Interaction)
+# ==========================================
+
+def run_notebook_lm_flow():
+    topic = "Key advancements in Quantum Computing in 2024"
+    
+    # הגדרת מזהה ייחודי לשיחה (Thread ID) - קריטי לצורך הזיכרון
+    config = {"configurable": {"thread_id": "session_1"}}
+    
+    # 🏁 הרצה ראשונית - הגרף ירוץ ויעצור ממש לפני שלב הסיכום
+    print("🚀 Starting NotebookLM Process...")
+    app.invoke({"topic": topic}, config)
+    
+    # שליפת המצב הנוכחי של הגרף לאחר העצירה
+    state_info = app.get_state(config)
+    raw_sources = state_info.values.get("raw_sources", [])
+    
+    # הצגת המקורות למשתמש בטרמינל
+    print("\n==========================================")
+    print("📋 SOURCES GATHERED BY AGENT:")
+    print("==========================================")
+    for src in raw_sources:
+        print(f"[{src['id']}] {src['title']}")
+        print(f"    Link: {src['url']}")
+        print(f"    Snippet: {src['content'][:150]}...\n")
+    print("==========================================")
+    
+    # 👥 שלב ה-Human in the loop: קבלת קלט מהמשתמש
+    user_input = input("Enter the source numbers you wish to approve (comma separated, e.g., '1,3,5'): ")
+    
+    # עיבוד בחירת המשתמש
+    try:
+        approved_ids = [int(x.strip()) for x in user_input.split(",") if x.strip().isdigit()]
+    except Exception:
+        approved_ids = []
+        
+    approved_sources = [src for src in raw_sources if src["id"] in approved_ids]
+    print(f"\n✅ You approved {len(approved_sources)} sources.")
+    
+    # עדכון ה-State של הגרף בבחירות של המשתמש בצורה מאובטחת
+    app.update_state(config, {"approved_sources": approved_sources})
+    
+    # 🔄 המשך הרצת הגרף מנקודת העצירה ועד לסיום
+    print("\n🔄 Resuming flow to generate summary...")
+    final_state = app.invoke(None, config)
+    
+    # הצגת התוצר הסופי
+    print("\n==========================================")
+    print("📝 FINAL INITIAL SUMMARY:")
+    print("==========================================")
+    print(final_state.get("summary", "No summary generated."))
+    print("==========================================")
+
 
 if __name__ == "__main__":
-    # הרצת בדיקה על נושא מסוים
-    test_topic = "React 19 key features and release updates"
-    run_research_agent(test_topic)
+    run_notebook_lm_flow()
